@@ -6,17 +6,25 @@ async function bounded(telemetry, callback) {
     finally { clearTimeout(timer); }
 }
 export function attachActorLifecycle(actor, telemetry) {
+    // Actor.init() may replace the Cloud event manager. Explicit workflows attach afterward.
+    const instance = typeof actor.getDefaultInstance === 'function' ? actor.getDefaultInstance() : actor;
+    if (instance.initialized === false) throw new Error('Attach telemetry lifecycle after successful Actor.init()');
+    const manager = actor.config?.getEventManager?.();
+    const target = manager?.on && manager?.off ? manager : actor;
     let instances = attached.get(actor);
     if (!instances) { instances = new Map(); attached.set(actor, instances); }
-    if (instances.has(telemetry)) return instances.get(telemetry);
-    if (typeof actor.on !== 'function' || typeof actor.off !== 'function') throw new TypeError('Actor.on/off are required');
+    const existing = instances.get(telemetry);
+    if (existing?.target === target) return existing.detach;
+    existing?.detach();
+    if (typeof target.on !== 'function' || typeof target.off !== 'function') throw new TypeError('Actor.on/off are required');
     const handlers = ['aborting', 'migrating', 'exit'].map((reason) => {
         const callback = () => { telemetry.breadcrumb('Actor lifecycle', { shutdownReason: reason }); return telemetry.flush(); };
-        actor.on(reason, callback); return [reason, callback];
+        target.on(reason, callback); return [reason, callback];
     });
     let unregister;
-    const detach = () => { for (const [reason, callback] of handlers) actor.off(reason, callback); instances.delete(telemetry); unregister?.(); };
-    instances.set(telemetry, detach);
+    let detached = false;
+    const detach = () => { if (detached) return; detached = true; for (const [reason, callback] of handlers) target.off(reason, callback); instances.delete(telemetry); unregister?.(); };
+    instances.set(telemetry, { target, detach });
     unregister = telemetry[Symbol.for('actor-telemetry.cleanup')](detach);
     return detach;
 }
@@ -40,13 +48,14 @@ export async function loadActorInput(actor, telemetry, { env = process.env, inpu
     }
 }
 export async function runActorMain(actor, telemetry, callback, options) {
-    const detach = attachActorLifecycle(actor, telemetry);
+    let detach;
     let callbackStarted = false;
     let handledFailure = false;
     let callbackFailure;
     try {
         return await actor.main(async () => {
             callbackStarted = true;
+            detach = attachActorLifecycle(actor, telemetry);
             let result;
             try { result = await callback(); }
             catch (error) {
@@ -60,7 +69,7 @@ export async function runActorMain(actor, telemetry, callback, options) {
     } catch (error) {
         if (!handledFailure || error !== callbackFailure) await bounded(telemetry, async () => { await telemetry.captureException(error, { operation: callbackStarted ? 'exit_actor' : 'initialize_actor', failure: { endedRun: true, shutdownReason: 'application_failure' } }); await telemetry.flush(); });
         throw error;
-    } finally { detach(); }
+    } finally { detach?.(); }
 }
 // For explicit init/exit workflows: caller owns init, persistence and cleanup; this owns only delivery before exit.
 // An application failure is captured even when the caller deliberately supplies exitCode: 0.

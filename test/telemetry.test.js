@@ -290,3 +290,120 @@ test('nested operation unwinding preserves innermost failure origin without leak
     await m.captureException(failure, { failure: { endedRun: true } }); assert.equal(events[0].tags.operation, 'inner');
     await m.withOperation({ operation: 'separate' }, () => m.captureException(failure)); assert.equal(events[1].tags.operation, 'separate'); assert.deepEqual(events[1].contexts.operation.request, {});
 });
+
+test('root progress/outcome annotations preserve request-local retry breadcrumbs and nested origin facts', async (t) => {
+    const { telemetry: m, events } = setup(t);
+    const failure = new Error('exhausted request');
+    await assert.rejects(() => m.withOperation({ operation: 'fetch_page', request: { id: 'one' } }, async () => {
+        m.breadcrumb('request started');
+        m.annotate(failure, { request: { httpStatus: 503 }, retry: { attempt: 2, limit: 2 }, failure: { abandonedOperation: true } });
+        m.breadcrumb('retry scheduled', { attempt: 1 }, 'warning');
+        m.breadcrumb('retry exhausted', { attempt: 2 }, 'error');
+        throw failure;
+    }), (error) => error === failure);
+    m.breadcrumb('unrelated root action');
+    m.annotate(failure, { progress: { saved: 1 }, failure: { partialOutput: true } });
+    m.annotate(failure, { progress: { processed: 2 }, failure: { endedRun: false, shutdownReason: 'origin' } });
+    await m.captureException(failure, { failure: { endedRun: true, shutdownReason: 'application_failure' } });
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0].breadcrumbs.map((action) => action.message), ['request started', 'retry scheduled', 'retry exhausted']);
+    assert.deepEqual(events[0].contexts.operation.request, { id: 'one', httpStatus: 503 });
+    assert.deepEqual(events[0].contexts.operation.progress, { saved: 1, processed: 2 });
+    assert.deepEqual(events[0].contexts.operation.failure, { abandonedOperation: true, partialOutput: true, endedRun: true, shutdownReason: 'application_failure' });
+});
+
+test('parent-scope reannotation preserves inner history and a reused Error gets fresh operation breadcrumbs', async (t) => {
+    const { telemetry: m, events } = setup(t);
+    const failure = new Error('reused');
+    await assert.rejects(() => m.withOperation({ operation: 'outer' }, async () => {
+        m.breadcrumb('outer action');
+        return m.withOperation({ operation: 'inner' }, async () => { m.breadcrumb('inner action'); throw failure; });
+    }), (error) => error === failure);
+    await m.captureException(failure);
+    await m.withOperation({ operation: 'independent' }, async () => {
+        m.breadcrumb('independent action');
+        m.annotate(failure, { errorCategory: 'network' });
+        await m.captureException(failure);
+    });
+    assert.deepEqual(events[0].breadcrumbs.map((action) => action.message), ['outer action', 'inner action']);
+    assert.deepEqual(events[1].breadcrumbs.map((action) => action.message), ['independent action']);
+    assert.equal(events[1].tags.operation, 'independent');
+});
+
+test('Actor.main lifecycle attaches after the actual SDK event-manager switch and cleans up the correct manager', async (t) => {
+    const { Actor } = await import(process.env.TELEMETRY_APIFY_MODULE || 'apify');
+    const actor = new Actor({ purgeOnStart: false });
+    const oldManager = actor.config.getEventManager();
+    const { telemetry: m } = setup(t);
+    let flushes = 0;
+    const originalFlush = m.flush;
+    m.flush = () => { flushes++; return originalFlush(); };
+    const options = { exit: false };
+    actor.main = async (callback, receivedOptions) => {
+        assert.equal(receivedOptions, options);
+        assert.equal(oldManager.listeners('migrating').length, 0);
+        // Use the same public SDK manager switch as Cloud Actor.init(), without network initialization.
+        actor.config.useEventManager(actor.eventManager);
+        actor.initialized = true;
+        return callback();
+    };
+    const unrelated = () => {};
+    actor.eventManager.on('migrating', unrelated);
+    await runActorMain(actor, m, async () => {
+        assert.equal(actor.eventManager.listeners('migrating').length, 2);
+        actor.eventManager.emit('migrating');
+        await actor.eventManager.waitForAllListenersToComplete();
+        assert.equal(flushes, 1);
+    }, options);
+    assert.deepEqual(actor.eventManager.listeners('migrating'), [unrelated]);
+    assert.equal(oldManager.listeners('migrating').length, 0);
+    actor.eventManager.off('migrating', unrelated);
+});
+
+test('explicit lifecycle attachment rejects uninitialized SDK instances and static Actor facades', async (t) => {
+    const { Actor } = await import(process.env.TELEMETRY_APIFY_MODULE || 'apify');
+    const actor = new Actor({ purgeOnStart: false });
+    const { telemetry: m } = setup(t);
+    assert.throws(() => attachActorLifecycle(actor, m), /after successful Actor.init/);
+    const facade = { getDefaultInstance: () => actor, on: actor.on.bind(actor), off: actor.off.bind(actor) };
+    assert.throws(() => attachActorLifecycle(facade, m), /after successful Actor.init/);
+    assert.equal(actor.config.getEventManager().listeners('migrating').length, 0);
+    actor.config.useEventManager(actor.eventManager);
+    actor.initialized = true;
+    const detach = attachActorLifecycle(actor, m);
+    assert.equal(actor.eventManager.listeners('migrating').length, 1);
+    detach();
+    assert.equal(actor.eventManager.listeners('migrating').length, 0);
+});
+
+test('lifecycle detach retains its original manager; reattachment after replacement is idempotent', async (t) => {
+    const { telemetry: m } = setup(t);
+    const oldManager = new EventEmitter(), newManager = new EventEmitter();
+    let manager = oldManager;
+    const actor = { initialized: true, config: { getEventManager: () => manager }, on: (...args) => manager.on(...args), off: (...args) => manager.off(...args) };
+    const unrelated = () => {}; oldManager.on('migrating', unrelated);
+    const oldDetach = attachActorLifecycle(actor, m);
+    manager = newManager;
+    const newDetach = attachActorLifecycle(actor, m);
+    assert.notEqual(oldDetach, newDetach);
+    assert.deepEqual(oldManager.listeners('migrating'), [unrelated]);
+    oldDetach();
+    assert.equal(attachActorLifecycle(actor, m), newDetach);
+    await m.dispose();
+    assert.equal(newManager.listenerCount('migrating'), 0);
+    assert.deepEqual(oldManager.listeners('migrating'), [unrelated]);
+});
+
+test('bundled smoke reports unsuccessful status when opt-in reporting is disabled, without network transport', async () => {
+    const script = new URL('../scripts/smoke.js', import.meta.url);
+    await assert.rejects(() => promisify(execFile)(process.execPath, [script.pathname, '--send'], {
+        timeout: 2500,
+        env: { SENTRY_DSN: 'https://synthetic@telemetry.invalid/1', SENTRY_ENVIRONMENT: 'test' },
+    }), (error) => {
+        assert.equal(error.code, 1);
+        const result = JSON.parse(error.stdout.trim());
+        assert.equal(result.capture.status, 'disabled');
+        assert.equal(result.flush.status, 'disabled');
+        return true;
+    });
+});

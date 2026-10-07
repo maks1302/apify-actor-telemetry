@@ -199,7 +199,19 @@ export function createActorTelemetry({ actorName, actorVersion = '0.0.0', inputS
         if (error && (typeof error === 'object' || typeof error === 'function')) {
             const prior = annotations.get(error);
             const previous = prior && (prior.id === state().id || prior.ancestors?.includes(state().id) || state().id === 'run') ? prior : undefined;
-            annotations.set(error, { id: previous && (state().id === 'run' || previous.ancestors?.includes(state().id)) ? previous.id : state().id, ancestors: previous?.ancestors || state().ancestors, context: { ...state().context, ...previous?.context, ...scrub.sanitize(context) }, breadcrumbs: [...state().breadcrumbs] });
+            const current = state();
+            const safe = scrub.sanitize(context);
+            const merged = { ...current.context, ...previous?.context, ...safe };
+            for (const key of ['request', 'retry', 'failure', 'progress']) merged[key] = { ...current.context[key], ...previous?.context[key], ...safe?.[key] };
+            const preserveOrigin = previous && previous.id !== current.id;
+            annotations.set(error, {
+                id: preserveOrigin ? previous.id : current.id,
+                ancestors: previous?.ancestors || current.ancestors,
+                context: merged,
+                // Unwinding into a parent/root scope must not replace request-local history.
+                // Within the origin scope, include actions added since an earlier annotation.
+                breadcrumbs: [...(preserveOrigin ? previous.breadcrumbs : current.breadcrumbs)],
+            });
         }
         return error;
     }

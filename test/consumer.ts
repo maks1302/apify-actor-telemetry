@@ -7,6 +7,7 @@ telemetry.logger?.info('local', { detail: true });
 telemetry.logger?.child({ prefix: 'child' }).info('child API preserved');
 const result: CaptureResult = await telemetry.withOperation(context, () => telemetry.captureException(new Error('failure')));
 telemetry.setRawInput({ ordinary: [1, false] }); telemetry.registerSecrets(['secret']);
+await Actor.init();
 attachActorLifecycle(Actor, telemetry);
 await loadActorInput(Actor, telemetry);
 await runActorMain(Actor, telemetry, async () => {});
