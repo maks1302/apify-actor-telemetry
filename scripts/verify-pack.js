@@ -12,8 +12,13 @@ const artifactDirectory = join(root, 'artifacts');
 await mkdir(artifactDirectory, { recursive: true });
 const { stdout } = await exec('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', artifactDirectory], { cwd: root });
 const [pack] = JSON.parse(stdout);
-assert.ok(pack.files.every(({ path }) => path === 'package.json' || path.startsWith('src/') || path === 'scripts/smoke.js'));
-assert.ok(pack.files.every(({ path }) => !/storage|credential|\.env|README|test\//i.test(path)));
+const documentationFiles = ['README.md', 'llms.txt', 'docs/api.md', 'docs/integration.md',
+    'docs/testing-and-upgrades.md', 'docs/agent-guide.md', 'prompts/integrate-actor.md',
+    'prompts/migrate-legacy-monitoring.md'];
+assert.ok(pack.files.every(({ path }) => path === 'package.json' || path.startsWith('src/')
+    || path === 'scripts/smoke.js' || documentationFiles.includes(path)));
+assert.ok(pack.files.every(({ path }) => !/storage|credential|\.env|test\//i.test(path)));
+for (const path of documentationFiles) assert.ok(pack.files.some((file) => file.path === path), `Missing packaged guide: ${path}`);
 const directory = await mkdtemp(join(tmpdir(), 'actor-telemetry-consumer-'));
 try {
     const modules = join(directory, 'node_modules');

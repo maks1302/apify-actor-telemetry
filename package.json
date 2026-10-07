@@ -18,7 +18,11 @@
   },
   "files": [
     "src",
-    "scripts/smoke.js"
+    "scripts/smoke.js",
+    "README.md",
+    "docs",
+    "prompts",
+    "llms.txt"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",

@@ -1,0 +1,21 @@
+# Apify Actor telemetry
+
+> Shared, bounded exception telemetry for Node.js Apify Actors. Package name: actor-telemetry-provisional. Inspect the selected revision's implementation and declarations before integrating.
+
+## Guides
+
+- [README](README.md): package overview and quick start.
+- [API](docs/api.md): configuration, methods, context, budgets, and statuses.
+- [Integration](docs/integration.md): input, retries, lifecycle, process ownership.
+- [Testing and upgrades](docs/testing-and-upgrades.md): mocked tests, smoke, pinned dependencies.
+- [Coding agent guide](docs/agent-guide.md): ownership and critical checks.
+
+## Copy-ready prompts
+
+- [Integrate an Actor](prompts/integrate-actor.md)
+- [Migrate legacy monitoring](prompts/migrate-legacy-monitoring.md)
+
+## API authority
+
+- [Core declarations](src/index.d.ts)
+- [Apify declarations](src/apify.d.ts)
