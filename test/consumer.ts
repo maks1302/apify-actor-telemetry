@@ -1,0 +1,15 @@
+import { Actor, log } from 'apify';
+import { createActorTelemetry, type EventContext, type CaptureResult } from '../src/index.js';
+import { attachActorLifecycle, loadActorInput, runActorMain, exitActor } from '../src/apify.js';
+const telemetry = createActorTelemetry({ actorName: 'type-consumer', actorVersion: '1.0.0', logger: log });
+const context: EventContext = { operation: 'fetch', errorCategory: 'network', request: { id: 'id', url: 'https://example.com', httpStatus: 500 }, retry: { attempt: 3, limit: 3, history: [{ attempt: 1 }] }, failure: { endedRun: true }, progress: { saved: 1 } };
+telemetry.logger?.info('local', { detail: true });
+telemetry.logger?.child({ prefix: 'child' }).info('child API preserved');
+const result: CaptureResult = await telemetry.withOperation(context, () => telemetry.captureException(new Error('failure')));
+telemetry.setRawInput({ ordinary: [1, false] }); telemetry.registerSecrets(['secret']);
+attachActorLifecycle(Actor, telemetry);
+await loadActorInput(Actor, telemetry);
+await runActorMain(Actor, telemetry, async () => {});
+await exitActor(Actor, telemetry, { exitOptions: { exit: false } });
+await telemetry.dispose();
+void result;

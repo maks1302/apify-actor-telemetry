@@ -1,0 +1,49 @@
+{
+  "name": "actor-telemetry-provisional",
+  "version": "0.1.0",
+  "description": "Bounded exception telemetry for independently built Apify Actors",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    },
+    "./apify": {
+      "types": "./src/apify.d.ts",
+      "import": "./src/apify.js"
+    }
+  },
+  "files": [
+    "src",
+    "scripts/smoke.js"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "smoke": "node scripts/smoke.js",
+    "check:types": "tsc --noEmit --strict --module NodeNext --moduleResolution NodeNext test/consumer.ts",
+    "check:pack": "node scripts/verify-pack.js"
+  },
+  "dependencies": {
+    "@sentry/node": "11.4.0"
+  },
+  "peerDependencies": {
+    "apify": ">=3.5.3 <4",
+    "@apify/log": ">=2.5.28 <3"
+  },
+  "peerDependenciesMeta": {
+    "apify": {
+      "optional": true
+    },
+    "@apify/log": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@apify/log": "2.5.28",
+    "apify": "3.5.3",
+    "typescript": "5.9.3"
+  }
+}
