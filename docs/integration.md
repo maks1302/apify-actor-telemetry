@@ -54,6 +54,10 @@ Use `withOperation` around each independent request/operation. Routine retries a
 
 `annotate(error, originContext)` retains request/origin facts without replacing the Error. At the terminal boundary, pass explicit final `failure` and `progress` facts to `captureException`. Earlier annotations cannot override explicit `endedRun` or `shutdownReason`. Separate operation scopes distinguish deliberate reuse of one Error; use `occurrenceId` for distinct root occurrences. Non-Error throws are safely normalized, but use original Error objects where possible for stack and occurrence continuity.
 
+Register the run's real counter object once with `telemetry.setProgress(progress)` before work begins. Include all four counters: `processed`, `succeeded`, `failed`, and `saved`. Lifecycle, top-level, and nested failures then have current counts even when their capture call does not supply progress. Increment existing counters at the same work boundaries as before; do not increment `failed` for every recoverable retry. Explicit capture progress can override individual values for a final outcome.
+
+Keep response text in a per-attempt variable before parsing or validation. On failure, call `telemetry.annotateResponse(error, { httpStatus, body }, originContext)` with parsed JSON when available, or the original text when parsing failed. This only enriches the original error. Continue reporting it at the Actor's existing failure boundary. See [response and progress contracts](api.md#failure-responses-and-progress) for byte limits, missing bodies, and retry isolation. The SDK cannot identify provider-level HTTP 200 error payloads without the Actor's validator.
+
 Severity: debug for details, info for progress/recovery/routine retries, warning for recoverable degradation, error for unrecovered/terminal failures. Fatal is reserved for process-wide failures. Local logger error calls do not automatically create remote issues.
 
 ## Lifecycle and process ownership

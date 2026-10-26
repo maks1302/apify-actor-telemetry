@@ -5,6 +5,7 @@ import * as http from 'node:http';
 import * as https from 'node:https';
 import { stripVTControlCharacters } from 'node:util';
 import { createSanitizer } from './sanitize.js';
+import { createResponseCapture } from './response.js';
 
 const categories = new Set(['input_validation', 'authentication', 'rate_limit', 'upstream_api', 'network', 'parsing', 'storage', 'internal', 'unknown']);
 const clamp = (value, fallback, max, min = 1) => Number.isFinite(Number(value)) && Number(value) >= min ? Math.min(Math.floor(Number(value)), max) : fallback;
@@ -34,6 +35,9 @@ export function createActorTelemetry({ actorName, actorVersion = '0.0.0', inputS
     const eventLimit = clamp(budgets.eventBytes, 200 * 1024, 256 * 1024, 160 * 1024);
     const lineLimit = clamp(budgets.logLineBytes, 1600, 4096, 128);
     const logLimit = clamp(budgets.logBytes, 32 * 1024, 64 * 1024, 1024);
+    const responseLimit = clamp(budgets.responseBytes, 16 * 1024, 64 * 1024, 128);
+    const responses = createResponseCapture(scrub, responseLimit);
+    let progressSource;
     const attachmentEnabled = capabilities.attachments?.enabled === true && capabilities.attachments?.verified === true;
     const environment = ['production', 'development', 'test'].includes(env.SENTRY_ENVIRONMENT) ? env.SENTRY_ENVIRONMENT : env.APIFY_IS_AT_HOME === '1' ? 'production' : 'development';
     const platform = (name) => env[`ACTOR_${name}`] || env[`APIFY_ACTOR_${name}`]; // Legacy APIFY_ACTOR_* SDK names.
@@ -93,7 +97,7 @@ export function createActorTelemetry({ actorName, actorVersion = '0.0.0', inputS
         catch { normalized = undefined; normalizedStatus = { complete: false, reason: 'normalized_input_not_json_serializable' }; }
     }
     function snapshot(context, breadcrumbs) {
-        const contexts = { actor_run: scrub.sanitize(metadata), operation: scrub.sanitize(context),
+        const contexts = { actor_run: scrub.sanitize(metadata), operation: sanitizeContext(context),
             recent_logs: { lines: scrub.sanitize(logs.map(({ secretVersion, ...line }) => ({ ...line, text: line.truncated && secretVersion !== scrub.secretVersion ? '[REDACTED: truncated log after secret registration]' : line.text }))), source: logSource ? '@apify/log:line' : 'unavailable', scope: 'shared_logger_only; excludes_console_subprocess_and_platform', available: Boolean(logSource), captured_at: new Date().toISOString(), truncated: droppedLines > 0 || logs.some((line) => line.truncated), max_lines: 20 },
             input_completeness: { ...rawStatus, limit_bytes: inputLimit } };
         const attachments = [];
@@ -117,11 +121,50 @@ export function createActorTelemetry({ actorName, actorVersion = '0.0.0', inputS
         }
         return { contexts, attachments, secretVersion: scrub.secretVersion, breadcrumbs: scrub.sanitize(breadcrumbs.slice(-50)) };
     }
+    function sanitizeContext(context) {
+        try {
+            const { response, ...other } = context;
+            const safe = scrub.sanitize(other);
+            if (response !== undefined) safe.response = responses.snapshot(response);
+            else if (Object.hasOwn(context, 'response')) safe.response = undefined;
+            return safe;
+        } catch {
+            return { diagnostic: '[UNAVAILABLE: context serialization failed]' };
+        }
+    }
+    function setProgress(source) {
+        // Keep a live source, but snapshot it synchronously at capture time.
+        // Actors own counter meanings and increments; the SDK never infers them.
+        progressSource = source;
+    }
+    function progressSnapshot(context, explicitProgress) {
+        let current;
+        let unavailable = false;
+        try { current = typeof progressSource === 'function' ? progressSource() : progressSource; }
+        catch { unavailable = true; }
+        const progress = {};
+        const invalid = new Set();
+        for (const source of [context.progress, current, explicitProgress]) {
+            if (!source || typeof source !== 'object') continue;
+            try {
+                for (const [key, value] of Object.entries(source)) {
+                    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) { progress[key] = value; invalid.delete(key); }
+                    else { delete progress[key]; invalid.add(key); }
+                }
+            } catch { unavailable = true; }
+        }
+        const missingFields = ['processed', 'succeeded', 'failed', 'saved'].filter((key) => progress[key] === undefined);
+        return { progress, completeness: { complete: !unavailable && missingFields.length === 0 && invalid.size === 0, missing_fields: missingFields,
+            ...(invalid.size ? { invalid_fields: [...invalid] } : {}), ...(unavailable ? { reason: 'progress_source_unavailable' } : {}) } };
+    }
     function safeguard(event, hint) {
         try {
             const rawValue = event.contexts?.raw_input;
             const normalizedValue = event.contexts?.normalized_input;
-            const safe = scrub.sanitize({ ...event, contexts: { ...event.contexts, raw_input: undefined, normalized_input: undefined } });
+            const response = event.contexts?.operation?.response;
+            const safe = scrub.sanitize({ ...event, contexts: { ...event.contexts, raw_input: undefined, normalized_input: undefined,
+                operation: { ...event.contexts?.operation, response: undefined } } });
+            if (response !== undefined) safe.contexts.operation.response = responses.snapshot(response);
             if (rawValue) safe.contexts.raw_input = scrub.sanitize(rawValue, { complete: true });
             if (normalizedValue) safe.contexts.normalized_input = scrub.sanitize(normalizedValue, { complete: true });
             delete safe.request; delete safe.server_name;
@@ -134,9 +177,12 @@ export function createActorTelemetry({ actorName, actorVersion = '0.0.0', inputS
                 safe.contexts.diagnostic_completeness = { complete: false, reason: 'event_budget_exceeded', limit_bytes: eventLimit };
                 if (safe.contexts.normalized_input) { delete safe.contexts.normalized_input; Object.assign(safe.contexts.normalized_input_completeness, { complete: false, reason: 'event_budget_exceeded' }); }
                 if (safe.exception?.values) safe.exception.values = safe.exception.values.map((value) => ({ ...value, value: boundText(value.value || '', 2048), stacktrace: { frames: (value.stacktrace?.frames || []).slice(-20).map((frame) => ({ filename: boundText(frame.filename || '', 512), function: boundText(frame.function || '', 256), lineno: frame.lineno, colno: frame.colno })) } }));
+                // Keep HTTP status and an explicit omission marker if total event
+                // pressure still requires dropping the body. Never silently lose it.
+                if (bytes(safe) > eventLimit && safe.contexts.operation.response) safe.contexts.operation.response = responses.omit(safe.contexts.operation.response);
                 if (bytes(safe) > eventLimit) {
                     const operation = safe.contexts.operation;
-                    safe.contexts.operation = scrub.sanitize({ operation: operation.operation, errorCategory: operation.errorCategory, failure: operation.failure, progress: operation.progress, request: operation.request, retry: { attempt: operation.retry?.attempt, limit: operation.retry?.limit } });
+                    safe.contexts.operation = scrub.sanitize({ operation: operation.operation, errorCategory: operation.errorCategory, failure: operation.failure, progress: operation.progress, response: responses.omit(operation.response), request: operation.request, retry: { attempt: operation.retry?.attempt, limit: operation.retry?.limit } });
                     while (safe.contexts.recent_logs.lines.length && bytes(safe) > eventLimit) { safe.contexts.recent_logs.lines.shift(); safe.contexts.recent_logs.truncated = true; }
                 }
                 if (bytes(safe) > eventLimit && safe.contexts.raw_input) { delete safe.contexts.raw_input; Object.assign(safe.contexts.input_completeness, { complete: false, reason: 'event_budget_exceeded', reference: metadata.input_storage_reference }); }
@@ -187,7 +233,7 @@ export function createActorTelemetry({ actorName, actorVersion = '0.0.0', inputS
     }
     function withOperation(context, callback) {
         const parent = state();
-        return local.run({ id: randomUUID(), context: { ...parent.context, ...scrub.sanitize(context) }, breadcrumbs: [...parent.breadcrumbs], ancestors: [...parent.ancestors, parent.id] }, () => {
+        return local.run({ id: randomUUID(), context: { ...parent.context, ...sanitizeContext(context) }, breadcrumbs: [...parent.breadcrumbs], ancestors: [...parent.ancestors, parent.id] }, () => {
             try {
                 const result = callback();
                 if (result && typeof result.then === 'function') return Promise.resolve(result).catch((error) => { annotate(error, {}); throw error; });
@@ -200,7 +246,7 @@ export function createActorTelemetry({ actorName, actorVersion = '0.0.0', inputS
             const prior = annotations.get(error);
             const previous = prior && (prior.id === state().id || prior.ancestors?.includes(state().id) || state().id === 'run') ? prior : undefined;
             const current = state();
-            const safe = scrub.sanitize(context);
+            const safe = sanitizeContext(context);
             const merged = { ...current.context, ...previous?.context, ...safe };
             for (const key of ['request', 'retry', 'failure', 'progress']) merged[key] = { ...current.context[key], ...previous?.context[key], ...safe?.[key] };
             const preserveOrigin = previous && previous.id !== current.id;
@@ -214,6 +260,10 @@ export function createActorTelemetry({ actorName, actorVersion = '0.0.0', inputS
             });
         }
         return error;
+    }
+    function annotateResponse(error, response, context = {}) {
+        try { return annotate(error, { ...context, response }); }
+        catch { return error; } // Enrichment must never replace an application error.
     }
     async function constructException(error) {
         const event = await client.eventFromException(error, {});
@@ -242,7 +292,10 @@ export function createActorTelemetry({ actorName, actorVersion = '0.0.0', inputS
         if (pending.size >= 64) return Promise.resolve({ status: 'failed', backendDelivery: 'unconfirmed' });
         const task = (async () => {
             try {
+                const progress = progressSnapshot(merged, context.progress);
+                merged.progress = progress.progress;
                 const savedSnapshot = snapshot(merged, origin?.breadcrumbs || current.breadcrumbs);
+                savedSnapshot.contexts.progress_completeness = progress.completeness;
                 const error = thrown instanceof Error ? thrown : new Error(typeof thrown === 'string' ? thrown : 'Non-Error value thrown');
                 const event = await constructException(error);
                 if (stoppedSending) return { status: 'disposed', backendDelivery: 'unconfirmed' };
@@ -255,7 +308,7 @@ export function createActorTelemetry({ actorName, actorVersion = '0.0.0', inputS
                 if (!(thrown instanceof Error)) event.contexts.operation.thrown_value = scrub.sanitize(thrown);
                 if (actorAwareGrouping) event.fingerprint = ['{{ default }}', actorName];
                 client.sendEvent(event, { attachments: savedSnapshot.attachments, data: { secretVersion: savedSnapshot.secretVersion } });
-                if (object && current.id !== 'run') annotations.set(thrown, { id: current.id, ancestors: current.ancestors, context: scrub.sanitize(merged), breadcrumbs: savedSnapshot.breadcrumbs });
+                if (object && current.id !== 'run') annotations.set(thrown, { id: current.id, ancestors: current.ancestors, context: sanitizeContext(merged), breadcrumbs: savedSnapshot.breadcrumbs });
                 return { status: 'accepted', eventId: event.event_id, backendDelivery: 'unconfirmed' };
             } catch { return { status: 'failed', backendDelivery: 'unconfirmed' }; }
         })();
@@ -296,10 +349,10 @@ export function createActorTelemetry({ actorName, actorVersion = '0.0.0', inputS
         disposed = true;
         for (const cleanup of [...cleanups]) { try { cleanup(); } catch { /* Own listeners only. */ } }
         cleanups.clear();
-        disposing = (async () => { const status = await flush(); await bounded(() => client?.close(flushTimeout)); stoppedSending = true; client?.dispose(); logs.length = 0; root.breadcrumbs.length = 0; raw = normalized = undefined; annotations = new WeakMap(); submissions = new WeakMap(); scrub.clear(); local.disable(); return status; })();
+        disposing = (async () => { const status = await flush(); await bounded(() => client?.close(flushTimeout)); stoppedSending = true; client?.dispose(); logs.length = 0; root.breadcrumbs.length = 0; raw = normalized = progressSource = undefined; annotations = new WeakMap(); submissions = new WeakMap(); responses.clear(); scrub.clear(); local.disable(); return status; })();
         return disposing;
     }
-    const api = { enabled: Boolean(client), environment, release, flushTimeout, logger: adaptedLogger, setRawInput, setNormalizedInput, registerSecrets: scrub.registerSecrets, breadcrumb, withOperation, annotate, captureException, flush, dispose, attachProcessHandlers,
+    const api = { enabled: Boolean(client), environment, release, flushTimeout, logger: adaptedLogger, setRawInput, setNormalizedInput, setProgress, registerSecrets: scrub.registerSecrets, breadcrumb, withOperation, annotate, annotateResponse, captureException, flush, dispose, attachProcessHandlers,
         setRawInputUnavailable(reason, { source = 'unavailable', reference } = {}) { raw = undefined; rawStatus = { complete: false, reason, source, reference }; } };
     // Shared with the optional adapter without exporting SDK/client state.
     Object.defineProperty(api, Symbol.for('actor-telemetry.cleanup'), { value: registerCleanup });

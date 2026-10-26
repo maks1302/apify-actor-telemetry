@@ -10,6 +10,8 @@ Core: environment/DSN validation, identity, required tags, sanitization, input s
 
 Actor: input-loading semantics and schema, operation/category facts, requests, retries, progress, final outcome, business behavior, billing/output, persistence, cleanup, intended exit status.
 
+For version 0.2+, register the Actor's live four-counter state with `setProgress` before work. Use `annotateResponse` with already-read JSON/text for HTTP, parsing, shape, and provider-level failures. Keep response state per attempt; never attach a previous attempt's body to a final network error. Do not introduce HTTP instrumentation, retry changes, or public raw-body logging to adopt these APIs. The SDK supplies bounded response retention and completeness metadata, but the Actor must provide actual counters and failure classification.
+
 Do not recreate core features in an Actor shim. Do not add direct Sentry imports, global init, another sanitizer/log buffer/deduper, or overlapping fatal handlers. Preserve unrelated handlers when removing legacy monitoring.
 
 ## Critical checks

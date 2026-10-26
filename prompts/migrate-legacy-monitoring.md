@@ -59,9 +59,14 @@ Use withOperation for independent requests, annotate original errors at origin,
 and captureException once at terminal failure boundaries. Use camelCase context:
 operation, errorCategory, request {id,url,hostname,httpStatus,elapsedMs}, retry
 {attempt,limit,history}, progress counters, failure {endedRun,abandonedOperation,
-partialOutput,shutdownReason}, and bounded diagnostic data. Categories are
+partialOutput,shutdownReason}, response {httpStatus,body}, and bounded diagnostic data. Categories are
 input_validation, authentication, rate_limit, upstream_api, network, parsing,
-storage, internal, unknown. Explicit final capture facts override origin annotation
+storage, internal, unknown. On SDK 0.2+, register the live four-counter state with
+setProgress before work, and annotateResponse with already-read JSON/text for
+HTTP, parse, shape, and HTTP 200 provider errors. Do not reuse a previous attempt's
+body on final network failure or change Actor retries/outcomes. Check response
+and progress completeness metadata for missing/omitted data.
+Explicit final capture facts override origin annotation
 and inherited context; preserve request facts and origin breadcrumbs. Preserve
 Errors/stacks/causes. Separate scopes distinguish reused Errors; use occurrenceId
 for distinct root occurrences. Do not mutate global request context or fingerprints.

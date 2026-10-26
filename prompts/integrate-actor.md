@@ -95,6 +95,7 @@ Use camelCase EventContext fields, according to the installed declarations:
     operation: 'fetch_page',
     errorCategory: 'upstream_api',
     request: { id, url, hostname, httpStatus, elapsedMs },
+    response: { httpStatus, body },
     retry: { attempt, limit, history },
     progress: { processed, succeeded, failed, saved },
     failure: { endedRun, abandonedOperation, partialOutput, shutdownReason },
@@ -105,6 +106,15 @@ Use stable operation names. Supported categories are input_validation,
 authentication, rate_limit, upstream_api, network, parsing, storage, internal,
 and unknown. Classification is Actor-owned; the core does not infer retryability.
 Use application progress counters, not Dataset.getInfo() for final Cloud counts.
+On SDK 0.2+, register the live four-counter object or callback with setProgress
+before work. Use real initialized zeros for pre-work failures. The SDK snapshots
+the source at capture time; explicit capture progress overrides it. Check
+progress_completeness rather than treating missing counters as zero.
+Use annotateResponse(error, {httpStatus, body}, originContext) with the already-read
+JSON/text for HTTP, parse, shape, and provider-level HTTP 200 failures. Keep body
+variables per attempt and clear stale responses on final network failure. Let the
+SDK bound/redact the response and report completeness; do not print raw bodies or
+change retries/business outcomes. Annotation alone does not create an issue.
 Let the core supply user identity and paying/free/unknown tier without fetching
 profiles or reinterpreting APIFY_USER_IS_PAYING as Actor revenue.
 

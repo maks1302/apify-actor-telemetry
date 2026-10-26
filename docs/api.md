@@ -27,10 +27,12 @@ The DSN selects the project. The package does not infer capabilities from its ho
 | `setRawInput(value, { source?, reference? }?)` | Snapshot original parsed input before mutation/defaults. Supply an honest source and token-free storage reference. |
 | `setRawInputUnavailable(reason, source?)` | Explicitly record missing/unreadable original input. The second argument has the same source/reference shape. |
 | `setNormalizedInput(value)` | Separate snapshot of effective input. Call again after Actor normalization if needed. |
+| `setProgress(countersOrCallback)` | Register live `processed`, `succeeded`, `failed`, and `saved` counters. Capture snapshots them synchronously. Pass `undefined` to unregister. |
 | `registerSecrets(values)` | Register secret string values, including strings nested in arrays/objects; re-sanitize retained data at transmission. |
 | `breadcrumb(message, data?, level?)` | Record a bounded recent action; default level `info`. Does not create an issue. |
 | `withOperation(context, callback)` | Async-local context; returns the callback's result and annotates/rethrows failures without capturing them. |
 | `annotate(error, context)` | Preserve origin facts; returns the original thrown value. Does not capture. |
+| `annotateResponse(error, { httpStatus?, body? }, context?)` | Preserve an already-read JSON/text response under `operation.response`; returns the original error. No stream reads, logging, retries, or submission. |
 | `captureException(error, context?)` | Capture an unrecovered failure; returns a promise of capture status. |
 | `flush()` | Bounded pending delivery; returns a promise of flush status. |
 | `dispose()` | Idempotent final cleanup, bounded flush/close, and removal of owned listeners/buffers. |
@@ -45,6 +47,7 @@ const context = {
     operation: 'fetch_page',
     errorCategory: 'upstream_api',
     request: { id: 'request-1', url: 'https://example.com/jobs', hostname: 'example.com', httpStatus: 503, elapsedMs: 800 },
+    response: { httpStatus: 503, body: { message: 'Provider temporarily unavailable' } },
     retry: { attempt: 3, limit: 3, history: [{ attempt: 2, httpStatus: 503, reason: 'upstream unavailable', elapsedMs: 700 }] },
     progress: { processed: 10, succeeded: 8, failed: 2, saved: 8 },
     failure: { endedRun: false, abandonedOperation: true, partialOutput: true, shutdownReason: 'retry_exhausted' },
@@ -58,6 +61,16 @@ Optional `level` accepts `error` or `fatal`; capture defaults to error. Optional
 
 Precedence is inherited operation context, then origin annotation, then explicit capture context. `request`, `retry`, `failure`, and `progress` merge in that order; explicit final outcome wins. Other fields are replaced by later values. Origin breadcrumbs survive parent/root re-annotation. The same Error object deduplicates within one occurrence; independent operation scopes represent independent occurrences. A failed local construction does not permanently mark the failure submitted.
 
+## Failure responses and progress
+
+`response` is supported both by `annotateResponse` and existing `annotate`/`withOperation`/`captureException` contexts. Bodies are snapshotted, redacted, and bounded separately from generic diagnostics. JSON bodies within budget remain structured, and text remains text, including empty strings. Oversized bodies become a useful text preview (serialized JSON for object bodies) ending in `[TRUNCATED]`. `response.completeness` supplies `complete`, `reason`, `truncated`, `format`, `sanitized_bytes`, and `limit_bytes` when applicable. Unavailable/unreadable bodies and total-event omission have explicit reasons. These byte counts describe the sanitized body, not wire bytes. Headers are not collected.
+
+The Actor must read each response only once and retain the text or parsed JSON before validation. Pass it to `annotateResponse` on HTTP errors, JSON parse errors, schema/shape failures, or provider error payloads returned with HTTP 200. Report at the existing terminal boundary. Network failures without a response must not reuse a prior attempt's body: use a fresh error and per-attempt variable, or annotate with `{}` to explicitly mark a missing response. Recovered attempts do not create events merely by annotation.
+
+Response capture does not automatically instrument HTTP clients or decide which payloads are errors. Do not pass streams, native fetch Responses, or Axios/got request/config objects. Existing business retry, output, and termination behavior remains Actor-owned. No response bodies are printed by the SDK. Later secret registration re-sanitizes outgoing bodies; a previously truncated preview is omitted if secret registration changed, because a partial secret may cross its boundary.
+
+For progress, register an object whose counters the Actor already updates, or a synchronous callback returning a fresh four-counter snapshot. Each event contains `contexts.progress_completeness`, listing missing or invalid counters. Missing values are not fabricated as zero. Real zeros should be initialized by the Actor before work starts. Counters must be finite, nonnegative numbers; extra numeric counters are allowed. A bad source cannot prevent error submission. The live source supersedes older operation/origin progress; explicit `captureException(..., { progress })` values supersede the live source. Without a registered source, existing annotation/capture merge semantics are preserved. Counter units and increments remain Actor-owned; the SDK never counts failed retries as failed work or queries dataset metadata.
+
 ## Budgets and sanitization
 
 These are conservative package policy limits, not claimed server limits. Values are clamped to safe bounds.
@@ -69,6 +82,7 @@ These are conservative package policy limits, not claimed server limits. Values 
 | `eventBytes` | 200 KiB | 160–256 KiB |
 | `logLineBytes` | 1600 bytes | 128–4096 bytes |
 | `logBytes` | 32 KiB | 1–64 KiB |
+| `responseBytes` | 16 KiB | 128 bytes–64 KiB |
 
 Raw input remains structurally complete when within budget, except secret redaction. Above the context budget, complete sanitized JSON can be attached only with explicitly enabled and verified attachment support, within the attachment budget. Otherwise it is omitted with completeness/size/reason/source/reference metadata. The attachment budget also caps retained raw input. Normalized input and diagnostic context are separately bounded. Total event budgeting can omit additional surfaces with explicit omission metadata.
 

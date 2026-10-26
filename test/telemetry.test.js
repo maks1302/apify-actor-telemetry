@@ -24,6 +24,166 @@ function setup(t, extra = {}) {
     return { telemetry, events, envelopes, logger, source, output };
 }
 
+test('response annotation preserves JSON/text, redacts secrets, and never consumes a stream or logs bodies', async (t) => {
+    const { telemetry: m, events, output } = setup(t, { env: { RAPID_API_KEY: 'rapid-private-value' } });
+    const body = { message: 'provider failed rapid-private-value', token: 'provider-token', detail: 'x'.repeat(5000) };
+    const original = structuredClone(body);
+    const error = new Error('Upstream request failed');
+    const stack = error.stack;
+    assert.equal(m.annotateResponse(error, { httpStatus: 503, body }, { errorCategory: 'upstream_api' }), error);
+    body.detail = 'later mutation';
+    assert.equal(events.length, 0);
+    await m.captureException(error);
+    const response = events[0].contexts.operation.response;
+    assert.equal(response.httpStatus, 503);
+    assert.equal(response.body.detail.length, 5000, 'separate response budget bypasses generic 4096-character marker');
+    assert.equal(response.body.token, '[REDACTED]');
+    assert.equal(response.body.message, 'provider failed [REDACTED]');
+    assert.equal(response.completeness.complete, true);
+    assert.equal(error.stack, stack);
+    assert.equal(original.detail.length, 5000);
+    assert.equal(output.length, 0);
+    for (const body of ['<html>provider failed</html>', '', null, false, [1, 2]]) {
+        await m.captureException(m.annotateResponse(new Error('failure'), { httpStatus: 200, body }, { errorCategory: 'parsing' }));
+        assert.deepEqual(events.at(-1).contexts.operation.response.body, body);
+        assert.equal(events.at(-1).contexts.operation.response.completeness.complete, true);
+    }
+});
+
+test('oversized response retains a byte-bounded useful preview and explicit metadata', async (t) => {
+    const { telemetry: m, events } = setup(t, { budgets: { responseBytes: 256 } });
+    for (const body of ['provider request abc: ' + '🧪\n'.repeat(3000), { request_id: 'abc', detail: 'x'.repeat(10000) }]) {
+        await m.captureException(m.annotateResponse(new Error('failure'), { httpStatus: 502, body }));
+        const response = events.at(-1).contexts.operation.response;
+        assert.equal(response.completeness.complete, false);
+        assert.equal(response.completeness.reason, 'response_exceeds_budget');
+        assert.equal(response.completeness.truncated, true);
+        assert.ok(Buffer.byteLength(JSON.stringify(response.body)) <= 256);
+        assert.match(response.body, /abc/);
+        assert.match(response.body, /\[TRUNCATED\]$/);
+        assert.ok(!response.body.includes('\uFFFD'), 'UTF-8 character boundaries preserved');
+    }
+});
+
+test('response late secret redaction and truncated-prefix invalidation remain safe', async (t) => {
+    const { telemetry: m, events } = setup(t);
+    const error = m.annotateResponse(new Error('failure'), { httpStatus: 403, body: { detail: 'register-later' } });
+    const capture = m.captureException(error);
+    m.registerSecrets('register-later');
+    await capture;
+    assert.equal(events[0].contexts.operation.response.body.detail, '[REDACTED]');
+    const { telemetry: small, events: previews } = setup(t, { budgets: { responseBytes: 128 } });
+    const truncated = small.annotateResponse(new Error('failure'), { httpStatus: 503, body: 'x'.repeat(100) + 'long-secret-crossing-preview-boundary'.repeat(20) });
+    const result = small.captureException(truncated);
+    small.registerSecrets('long-secret-crossing-preview-boundary');
+    await result;
+    assert.equal(previews[0].contexts.operation.response.body, undefined);
+    assert.equal(previews[0].contexts.operation.response.completeness.reason, 'secret_registered_after_truncation');
+});
+
+test('response capture supports legacy annotations, concurrency, and final-network-attempt clearing', async (t) => {
+    const { telemetry: m, events } = setup(t);
+    await Promise.all(['one', 'two'].map((id) => m.withOperation({ request: { id } }, async () => {
+        const error = new Error('failure');
+        m.annotate(error, { response: { httpStatus: 503, body: { request_id: id } } });
+        await new Promise((resolve) => setImmediate(resolve));
+        await m.captureException(error);
+    })));
+    for (const event of events) assert.equal(event.contexts.operation.response.body.request_id, event.contexts.operation.request.id);
+    const error = m.annotateResponse(new Error('failure'), { httpStatus: 503, body: 'earlier response' });
+    m.annotateResponse(error, {}, { errorCategory: 'network' });
+    await m.captureException(error);
+    assert.equal(events.at(-1).contexts.operation.response.body, undefined);
+    assert.equal(events.at(-1).contexts.operation.response.httpStatus, undefined);
+    assert.equal(events.at(-1).contexts.operation.response.completeness.reason, 'response_body_unavailable');
+});
+
+test('response survives operation unwinding, progress reannotation, and root capture', async (t) => {
+    const { telemetry: m, events } = setup(t);
+    const error = new Error('original failure');
+    await assert.rejects(() => m.withOperation({ operation: 'outer' }, () =>
+        m.withOperation({ operation: 'fetch_page', request: { id: 'one' } }, async () => {
+            m.annotateResponse(error, { httpStatus: 503, body: { request_id: 'one', detail: 'x'.repeat(5000) } });
+            throw error;
+        })), (thrown) => thrown === error);
+    m.annotate(error, { progress: { processed: 1, succeeded: 0, failed: 1, saved: 0 } });
+    await m.captureException(error, { failure: { endedRun: true } });
+    assert.equal(events[0].contexts.operation.response.body.detail.length, 5000);
+    assert.equal(events[0].contexts.operation.response.body.request_id, 'one');
+    assert.equal(events[0].contexts.operation.operation, 'fetch_page');
+    assert.equal(events[0].contexts.operation.progress.failed, 1);
+});
+
+test('unreadable and cyclic response bodies do not hide the application failure', async (t) => {
+    const { telemetry: m, events } = setup(t);
+    const cyclic = { message: 'provider failed' }; cyclic.self = cyclic;
+    const hostile = { get body() { throw new Error('unreadable'); }, httpStatus: 502 };
+    for (const response of [{ httpStatus: 503 }, { httpStatus: 200, body: cyclic }, hostile]) {
+        const error = new Error('original failure');
+        assert.equal(m.annotateResponse(error, response), error);
+        assert.equal((await m.captureException(error)).status, 'accepted');
+        assert.equal(events.at(-1).exception.values.at(-1).value, 'original failure');
+        assert.equal(events.at(-1).contexts.operation.response.completeness.complete, false);
+    }
+});
+
+test('event budget keeps response omission status and progress instead of silently dropping the response', async (t) => {
+    const { telemetry: m, events } = setup(t, { budgets: { eventBytes: 160 * 1024, responseBytes: 64 * 1024, inputBytes: 128 * 1024 } });
+    const counters = { processed: 1, succeeded: 0, failed: 1, saved: 0 };
+    m.setProgress(counters);
+    m.setRawInput({ ordinary: 'x'.repeat(120000) });
+    m.setNormalizedInput({ ordinary: 'y'.repeat(64000) });
+    await m.captureException(m.annotateResponse(new Error('failure'), { httpStatus: 503, body: 'z'.repeat(60000) }));
+    const event = events[0];
+    assert.equal(event.contexts.operation.response.httpStatus, 503);
+    assert.equal(event.contexts.operation.response.completeness.complete, false);
+    assert.equal(event.contexts.operation.response.completeness.reason, 'event_budget_exceeded');
+    assert.deepEqual(event.contexts.operation.progress, counters);
+    assert.ok(Buffer.byteLength(JSON.stringify(event)) <= 160 * 1024);
+});
+
+test('live progress snapshots reflect failure-time state, explicit outcomes, and capture-time isolation', async (t) => {
+    const { telemetry: m, events } = setup(t);
+    const progress = { processed: 1, succeeded: 1, failed: 0, saved: 4 };
+    m.setProgress(progress);
+    const failure = new Error('failure');
+    m.annotate(failure, { progress: { ...progress } });
+    progress.processed = 2; progress.failed = 1;
+    const captured = m.captureException(failure, { progress: { saved: 5 } });
+    progress.saved = 100;
+    await captured;
+    assert.deepEqual(events[0].contexts.operation.progress, { processed: 2, succeeded: 1, failed: 1, saved: 5 });
+    assert.equal(events[0].contexts.progress_completeness.complete, true);
+    m.setProgress(() => progress);
+    await m.captureException(new Error('later failure'));
+    assert.equal(events[1].contexts.operation.progress.saved, 100);
+});
+
+test('missing or invalid progress stays explicit rather than inventing counts or suppressing errors', async (t) => {
+    const { telemetry: m, events } = setup(t);
+    await m.captureException(new Error('startup'));
+    assert.deepEqual(events[0].contexts.progress_completeness.missing_fields, ['processed', 'succeeded', 'failed', 'saved']);
+    assert.equal(events[0].contexts.operation.progress.failed, undefined);
+    m.setProgress(() => { throw new Error('bad counter getter'); });
+    await m.captureException(new Error('failure'), { progress: { saved: 3, failed: NaN, succeeded: -1 } });
+    assert.equal(events[1].contexts.operation.progress.saved, 3);
+    assert.equal(events[1].contexts.operation.progress.failed, undefined);
+    assert.equal(events[1].contexts.progress_completeness.reason, 'progress_source_unavailable');
+    assert.deepEqual(events[1].contexts.progress_completeness.invalid_fields.sort(), ['failed', 'succeeded']);
+});
+
+test('initialized startup counters and hostile annotation contexts preserve reporting semantics', async (t) => {
+    const { telemetry: m, events } = setup(t);
+    m.setProgress({ processed: 0, succeeded: 0, failed: 0, saved: 0 });
+    const error = new Error('startup failure');
+    const context = { get response() { throw new Error('bad context getter'); } };
+    assert.equal(m.annotate(error, context), error);
+    await m.captureException(error);
+    assert.deepEqual(events[0].contexts.operation.progress, { processed: 0, succeeded: 0, failed: 0, saved: 0 });
+    assert.equal(events[0].contexts.progress_completeness.complete, true);
+    assert.equal(events[0].exception.values.at(-1).value, 'startup failure');
+});
+
 test('identity, complete original/normalized input, actual chronological last 20 logs and capture-time snapshot', async (t) => {
     const { telemetry: m, events, logger, source, output } = setup(t, { env: { APIFY_USER_IS_PAYING: '1', APIFY_USER_ID: 'user', ACTOR_ID: 'actor', ACTOR_RUN_ID: 'run', ACTOR_TASK_ID: 'task', ACTOR_BUILD_ID: 'build', ACTOR_BUILD_NUMBER: '42', ACTOR_DEFAULT_KEY_VALUE_STORE_ID: 'store' } });
     const raw = { ordinary: { values: [false, null, 12] }, longArray: Array(150).fill('yes'), urls: ['https://example.com/?q=a%20b#ordinary'], password: 'secret-value' };

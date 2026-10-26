@@ -2,7 +2,7 @@
 
 Shared exception reporting for independently built Node.js Apify Actors. The package keeps Sentry details out of scraping code and supplies sanitized input, Actor/run identity, recent logger output, operation context, and bounded delivery.
 
-**Package:** `actor-telemetry-provisional` · **Version:** `0.1.1` · **ESM only** · **Node:** `>=20.19.0`
+**Package:** `actor-telemetry-provisional` · **Version:** `0.2.0` · **ESM only** · **Node:** `>=20.19.0`
 
 The official `@sentry/node` SDK is an internal dependency. Basic exception reporting can target Sentry or GlitchTip through `SENTRY_DSN`. The package does not provision monitoring projects or discover backend capabilities.
 
@@ -71,6 +71,10 @@ Only `SENTRY_DSN` is needed to enable remote reporting. Missing or invalid confi
 Apify identity variables are consumed automatically when available. Tests must pass an explicit test environment and mocked transport. No tracing, profiling, SDK log ingestion, or automatic global Sentry initialization is enabled.
 
 ## What is retained
+
+HTTP failures can carry an explicit JSON or text response body through `annotateResponse(error, { httpStatus, body }, context?)`. Responses have their own 16 KiB default budget, redaction, useful bounded previews, and completeness metadata. The Actor supplies the already-read body; the SDK never consumes a response stream, changes retries, or prints its body in public logs. HTTP 200 parse/validation failures should use the same annotation when the Actor reports them.
+
+Register the Actor's live counters with `setProgress(counters)` or `setProgress(() => counters)`. Every failure snapshots the current counters before asynchronous event construction; explicit capture progress wins. Supply `processed`, `succeeded`, `failed`, and `saved` using the Actor's existing units. `contexts.progress_completeness` identifies missing/invalid counters or an unavailable source instead of inventing zero counts. The SDK does not increment counters or query datasets.
 
 Original input is independently snapshotted and sanitized; normalized input is separate. Oversized input has explicit omission/completeness metadata, with an available storage reference. Complete sanitized attachments require explicit, verified destination support. Later secret registration sanitizes retained data before transmission; it cannot retract data already sent.
 

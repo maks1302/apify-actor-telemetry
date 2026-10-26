@@ -29,6 +29,8 @@ if (capture.status !== 'accepted' || flush.status !== 'drained' || submissions !
 
 This transport is a test seam; production Actor code should not depend on Sentry envelope structure. Actor integration tests should exercise the installed package, not replace it with a mock that hides wiring mistakes. Focus on input ordering, logger wiring, retry exhaustion, final outcomes, concurrency, and lifecycle boundaries. Fatal-handler tests need child processes so termination can be verified safely.
 
+Version 0.2 adds `annotateResponse`, typed response context, `responseBytes`, and `setProgress`; existing callers remain supported. Test HTTP errors, HTTP 200 invalid JSON/shape/provider errors, text fallbacks, response and event size limits, late secret registration, recovered retries, a final network failure after an HTTP failure, and concurrent requests. Check that failure progress has the Actor's four current counters and that pre-work failures have honest initialized zeros or explicit missing-counter metadata. Upgrading the SDK alone does not wire Actor counter sources or preserve unread response bodies.
+
 From the core checkout, after dependencies are available:
 
 ```sh

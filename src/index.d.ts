@@ -4,11 +4,19 @@ export interface RequestContext { id?: string; url?: string; hostname?: string; 
 export interface RetryAttempt { attempt: number; httpStatus?: number; reason?: string; elapsedMs?: number; }
 export interface RetryContext { attempt?: number; limit?: number; history?: RetryAttempt[]; }
 export interface FailureContext { endedRun?: boolean; abandonedOperation?: boolean; partialOutput?: boolean; shutdownReason?: string; }
+export interface ProgressContext { processed: number; succeeded: number; failed: number; saved: number; [counter: string]: number; }
+export interface ResponseContext {
+    httpStatus?: number;
+    /** Already-read JSON or text. Never pass a fetch Response, stream, or client configuration. */
+    body?: unknown;
+    completeness?: { complete: boolean; reason?: string; truncated?: boolean; format?: 'text' | 'json'; sanitized_bytes?: number; limit_bytes?: number };
+}
 /** Precedence: inherited operation < origin annotation < capture context. Nested request/retry/failure/progress merge in that order. */
 export interface EventContext {
     operation?: string;
     errorCategory?: ErrorCategory;
     request?: RequestContext;
+    response?: ResponseContext;
     retry?: RetryContext;
     failure?: FailureContext;
     progress?: Record<string, number>;
@@ -37,7 +45,7 @@ export interface TelemetryOptions<L extends Logger = Logger> {
     logger?: L;
     env?: Record<string, string | undefined>;
     transport?: TransportFactory;
-    budgets?: { inputBytes?: number; attachmentBytes?: number; eventBytes?: number; logLineBytes?: number; logBytes?: number };
+    budgets?: { inputBytes?: number; attachmentBytes?: number; eventBytes?: number; logLineBytes?: number; logBytes?: number; responseBytes?: number };
     /** Verified means the caller has confirmed attachment support for this destination/version. No hostname inference. */
     capabilities?: { attachments?: { enabled: boolean; verified: boolean } };
     actorAwareGrouping?: boolean;
@@ -50,11 +58,15 @@ export interface ActorTelemetry<L extends Logger = Logger> {
     readonly logger: L | undefined;
     setRawInput(value: unknown, source?: InputSource): void;
     setNormalizedInput(value: unknown): void;
+    /** Read live Actor counters synchronously at capture time. Explicit capture progress overrides this source. */
+    setProgress(source: ProgressContext | (() => ProgressContext) | undefined): void;
     setRawInputUnavailable(reason: string, source?: InputSource): void;
     registerSecrets(values: unknown): void;
     breadcrumb(message: string, data?: unknown, level?: Level): void;
     withOperation<T>(context: EventContext, callback: () => T): T;
     annotate<T>(error: T, context: EventContext): T;
+    /** Snapshot a sanitized, bounded response without reading a stream, logging a body, or submitting an event. */
+    annotateResponse<T>(error: T, response: ResponseContext, context?: EventContext): T;
     captureException(error: unknown, context?: EventContext): Promise<CaptureResult>;
     flush(): Promise<FlushResult>;
     dispose(): Promise<FlushResult>;
